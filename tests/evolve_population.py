@@ -7,6 +7,7 @@ import vision_genprog.tasks.image_processing as image_processing
 import vision_genprog.semanticSegmentersPop as semanticSegmentersPop
 import os
 import ast
+import synthetic_heatmap.generators.stop_sign as stop_sign
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)-15s %(message)s')
 
@@ -20,7 +21,12 @@ def main(
     proportionOfConstants,
     constantCreationParametersList,
     numberOfGenerations,
-    weightForNumberOfNodes
+    weightForNumberOfNodes,
+    numberOfTournamentParticipants,
+    mutationProbability,
+    proportionOfNewIndividuals,
+    maximumNumberOfMissedCreationTrials,
+    numberOfTrainingPairs
     ):
     logging.info("evolve_population.main()")
 
@@ -52,25 +58,80 @@ def main(
     )
 
     # Original population cost
-    individual_to_cost_dict = semantic_segmenters_pop.EvaluateIndividualCosts(
+    validation_individual_to_cost_dict = semantic_segmenters_pop.EvaluateIndividualCosts(
         inputOutputTuplesList=validation_input_output_tuples,
         variableNameToTypeDict=variableName_to_type,
         interpreter=interpreter,
         returnType=return_type,
         weightForNumberOfElements=weightForNumberOfNodes
     )
-    (champion, lowest_cost) = semantic_segmenters_pop.Champion(individual_to_cost_dict)
-    median_cost = semantic_segmenters_pop.MedianCost(individual_to_cost_dict)
-    average_cost = semantic_segmenters_pop.AverageCost(individual_to_cost_dict)
-    cost_std_dev = semantic_segmenters_pop.StandardDeviationOfCost(individual_to_cost_dict)
-
+    (champion, validation_lowest_cost) = semantic_segmenters_pop.Champion(validation_individual_to_cost_dict)
+    validation_median_cost = semantic_segmenters_pop.MedianCost(validation_individual_to_cost_dict)
+    validation_average_cost = semantic_segmenters_pop.AverageCost(validation_individual_to_cost_dict)
+    validation_cost_std_dev = semantic_segmenters_pop.StandardDeviationOfCost(validation_individual_to_cost_dict)
+    train_individual_to_cost_dict = None
     with open(os.path.join(args.outputDirectory, "generations.csv"), 'w+') as generations_file:
-        generations_file.write("generation,lowest_cost,median_cost,average_cost,cost_std_dev\n")
-        generations_file.write("0,{},{},{},{}\n".format(lowest_cost, median_cost, average_cost, cost_std_dev))
+        generations_file.write("generation,train_lowest_cost,validation_lowest_cost,train_median_cost,validation_median_cost,train_average_cost,validation_average_cost,train_cost_std_dev,validation_cost_std_dev\n")
+        generations_file.write("0,-,{},-,{},-,{},-,{}\n".format(validation_lowest_cost, validation_median_cost, validation_average_cost, validation_cost_std_dev))
+
+    # Create a generator of stop sign image and heatmaps
+    stop_sign_generator = stop_sign.StopSign()
+
+    lowest_validation_champion_cost = 1.0e9
 
     for generation_ndx in range(1, numberOfGenerations + 1):
         logging.info("***** Generation {} *****".format(generation_ndx))
 
+        # Generate synthetic training input-output tuples
+        train_input_output_tuples_list = GenerateSyntheticInputOutputTuples(
+            stop_sign_generator, imageShapeHW, numberOfTrainingPairs
+        )
+        # Evolve one generation
+        train_individual_to_cost_dict = semantic_segmenters_pop.NewGenerationWithTournament(
+            inputOutputTuplesList=train_input_output_tuples_list,
+            variableNameToTypeDict=variableName_to_type,
+            interpreter=interpreter,
+            returnType=return_type,
+            numberOfTournamentParticipants=numberOfTournamentParticipants,
+            mutationProbability=mutationProbability,
+            currentIndividualToCostDict=train_individual_to_cost_dict,
+            proportionOfConstants=proportionOfConstants,
+            levelToFunctionProbabilityDict=levelToFunctionProbabilityDict,
+            functionNameToWeightDict=None,
+            constantCreationParametersList=constantCreationParametersList,
+            proportionOfNewIndividuals=proportionOfNewIndividuals,
+            weightForNumberOfElements=weightForNumberOfNodes,
+            maximumNumberOfMissedCreationTrials=maximumNumberOfMissedCreationTrials
+        )
+        train_champion, train_lowest_cost = semantic_segmenters_pop.Champion(train_individual_to_cost_dict)
+        train_median_cost = semantic_segmenters_pop.MedianCost(train_individual_to_cost_dict)
+        train_average_cost = semantic_segmenters_pop.AverageCost(train_individual_to_cost_dict)
+        train_cost_std_dev = semantic_segmenters_pop.StandardDeviationOfCost(train_individual_to_cost_dict)
+
+        # Validation of the new population
+        validation_individual_to_cost_dict = semantic_segmenters_pop.EvaluateIndividualCosts(
+            inputOutputTuplesList=validation_input_output_tuples,
+            variableNameToTypeDict=variableName_to_type,
+            interpreter=interpreter,
+            returnType=return_type,
+            weightForNumberOfElements=weightForNumberOfNodes
+        )
+        (champion, validation_lowest_cost) = semantic_segmenters_pop.Champion(validation_individual_to_cost_dict)
+        validation_median_cost = semantic_segmenters_pop.MedianCost(validation_individual_to_cost_dict)
+        validation_average_cost = semantic_segmenters_pop.AverageCost(validation_individual_to_cost_dict)
+        validation_cost_std_dev = semantic_segmenters_pop.StandardDeviationOfCost(validation_individual_to_cost_dict)
+
+        logging.info("train_lowest_cost = {}; validation_lowest_cost = {}".format(train_lowest_cost, validation_lowest_cost))
+        with open(os.path.join(args.outputDirectory, "generations.csv"), 'a') as generations_file:
+            generations_file.write("{},{},{},{},{},{},{},{},{}\n".format(generation_ndx,
+                                                                        train_lowest_cost, validation_lowest_cost,
+                                                                        train_median_cost, validation_median_cost,
+                                                                        train_average_cost, validation_average_cost,
+                                                                        train_cost_std_dev, validation_cost_std_dev))
+        if validation_lowest_cost < lowest_validation_champion_cost:
+            lowest_validation_champion_cost = validation_lowest_cost
+            champion_filepath = os.path.join(outputDirectory, "champion_{}_{:.4f}.xml".format(generation_ndx, validation_lowest_cost))
+            champion.Save(champion_filepath)
 
 def InputOutputTuples(image_pairs_directory, expected_image_shapeHW, variable_name='image'):
     # List[Tuple[Dict[str, Any], Any]]
@@ -98,6 +159,15 @@ def InputHeatmapFilepaths(images_directory):
         input_heatmap_filepaths.append((input_filepath, corresponding_heatmap_filepath))
     return input_heatmap_filepaths
 
+def GenerateSyntheticInputOutputTuples(generator, image_sizeHW, number_of_pairs_to_generate,
+                                       variable_name='image'):
+    input_output_tuples_list = []
+    for image_ndx in range(number_of_pairs_to_generate):
+        (input_image, heatmap, result_msg) = generator.Generate(image_sizeHW)
+        input_output_tuples_list.append(({variable_name: input_image}, heatmap))
+    return input_output_tuples_list
+
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -120,6 +190,16 @@ if __name__ == '__main__':
     parser.add_argument('--weightForNumberOfNodes',
                         help="Penalty term proportional to the number of nodes. Default: 0.001", type=float,
                         default=0.001)
+    parser.add_argument('--numberOfTournamentParticipants',
+                        help="The number of participants in selection tournaments. Default: 2", type=int, default=2)
+    parser.add_argument('--mutationProbability', help="The probability to mutate a child. Default: 0.1", type=float,
+                        default=0.1)
+    parser.add_argument('--proportionOfNewIndividuals',
+                        help="The proportion of randomly generates individuals per generation. Default: 0.1",
+                        type=float, default=0.1)
+    parser.add_argument('--maximumNumberOfMissedCreationTrials',
+                        help="The maximum number if missed creation trials. Default: 1000", type=int, default=1000)
+    parser.add_argument('--numberOfTrainingPairs', help="The number of generated training pairs, per epoch. Default: 160", type=int, default=160)
     args = parser.parse_args()
 
     imageShapeHW = ast.literal_eval(args.imageShapeHW)
@@ -135,5 +215,10 @@ if __name__ == '__main__':
         args.proportionOfConstants,
         constantCreationParametersList,
         args.numberOfGenerations,
-        args.weightForNumberOfNodes
+        args.weightForNumberOfNodes,
+        args.numberOfTournamentParticipants,
+        args.mutationProbability,
+        args.proportionOfNewIndividuals,
+        args.maximumNumberOfMissedCreationTrials,
+        args.numberOfTrainingPairs
     )
